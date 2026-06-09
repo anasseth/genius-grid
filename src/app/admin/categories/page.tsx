@@ -9,10 +9,20 @@ export default async function CategoriesPage() {
   const { data: { user } } = await supabase.auth.getUser()
   if (!user) redirect('/admin/login')
 
-  const { data: categories } = await supabase
-    .from('categories')
-    .select('*')
-    .order('created_at', { ascending: false })
+  const [{ data: categories }, { data: quizCounts }] = await Promise.all([
+    supabase.from('categories').select('*').order('created_at', { ascending: false }),
+    supabase.from('quizzes').select('category_id'),
+  ])
 
-  return <CategoriesClient initialCategories={categories ?? []} />
+  const countMap: Record<string, number> = {}
+  for (const q of quizCounts ?? []) {
+    if (q.category_id) countMap[q.category_id] = (countMap[q.category_id] ?? 0) + 1
+  }
+
+  return (
+    <CategoriesClient
+      initialCategories={categories ?? []}
+      quizCountMap={countMap}
+    />
+  )
 }
