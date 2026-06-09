@@ -3,13 +3,30 @@
 import { useEffect, useState, useCallback } from 'react'
 import { useRouter } from 'next/navigation'
 import { motion, AnimatePresence } from 'framer-motion'
-import { ChevronLeft, User } from 'lucide-react'
-import type { Quiz, Question } from '@/lib/types'
+import { ChevronLeft, User, AlertCircle } from 'lucide-react'
+import type { Quiz } from '@/lib/types'
 import { createClient } from '@/lib/supabase/client'
+import { QuizPlaybackProvider, useQuizPlayback } from '@/context/QuizPlaybackContext'
+
+// Safe client-side option type: intentionally excludes is_correct to prevent
+// answer exposure. Correct answers are evaluated server-side via /api/evaluate.
+interface SafeOption {
+  id: string
+  text: string
+  option_label: string
+}
+
+interface SafeQuestion {
+  id: string
+  text: string
+  order_index: number
+  contributed_by: string | null
+  options?: SafeOption[]
+}
 
 interface Props {
   quiz: Quiz
-  questions: Question[]
+  questions: SafeQuestion[]
   attemptId: string
   userId: string
 }
@@ -20,96 +37,69 @@ function formatTime(seconds: number) {
   return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`
 }
 
-export default function QuizClient({ quiz, questions, attemptId, userId }: Props) {
+function QuizInner({ quiz, questions, attemptId }: Props) {
   const router = useRouter()
   const supabase = createClient()
 
+  const {
+    playbackState,
+    currentQIndex,
+    answers,
+    error: evalError,
+    selectAnswer,
+    advanceQuestion,
+    finalize,
+  } = useQuizPlayback()
+
   const totalQuestions = questions.length
-
-  const [currentQIndex, setCurrentQIndex] = useState(0)
-  const [selectedOption, setSelectedOption] = useState<string | null>(null)
-  const [timeLeft, setTimeLeft] = useState(quiz.time_per_question)
-  const [submitting, setSubmitting] = useState(false)
-
   const currentQuestion = questions[currentQIndex]
+  const selectedOptionId = answers[currentQuestion?.id ?? ''] ?? null
+
+  const [timeLeft, setTimeLeft] = useState(quiz.time_per_question)
+
+  // Reset timer each time the question changes
+  useEffect(() => {
+    setTimeLeft(quiz.time_per_question)
+  }, [currentQIndex, quiz.time_per_question])
 
   const handleNext = useCallback(async () => {
-    if (submitting) return
-    setSubmitting(true)
+    if (playbackState === 'SYNCING') return
 
-    const selectedOpt = selectedOption
-      ? currentQuestion?.options?.find((o) => o.id === selectedOption)
-      : null
-
+    // Persist this answer to user_answers. is_correct is intentionally omitted;
+    // the evaluate route sets it correctly server-side after submission.
     if (currentQuestion) {
       await supabase.from('user_answers').insert({
         attempt_id: attemptId,
         question_id: currentQuestion.id,
-        selected_option_id: selectedOpt?.id ?? null,
-        is_correct: selectedOpt?.is_correct ?? false,
+        selected_option_id: selectedOptionId ?? null,
       })
     }
 
     if (currentQIndex === totalQuestions - 1) {
-      const { data: allAnswers } = await supabase
-        .from('user_answers')
-        .select('is_correct')
-        .eq('attempt_id', attemptId)
-
-      const totalCorrect = (allAnswers ?? []).filter((a) => a.is_correct).length
-      const pointsEarned = totalCorrect * 10
-
-      await supabase
-        .from('quiz_attempts')
-        .update({
-          score: totalCorrect,
-          total_questions: totalQuestions,
-          points_earned: pointsEarned,
-          is_completed: true,
-          completed_at: new Date().toISOString(),
-        })
-        .eq('id', attemptId)
-
-      const { data: profileData } = await supabase
-        .from('profiles')
-        .select('points')
-        .eq('id', userId)
-        .single()
-
-      if (profileData) {
-        await supabase
-          .from('profiles')
-          .update({ points: (profileData.points ?? 0) + pointsEarned, updated_at: new Date().toISOString() })
-          .eq('id', userId)
+      const result = await finalize(attemptId, totalQuestions)
+      if (result) {
+        router.push(`/results/${attemptId}`)
       }
-
-      router.push(`/results/${attemptId}`)
     } else {
-      setCurrentQIndex((prev) => prev + 1)
-      setSelectedOption(null)
-      setTimeLeft(quiz.time_per_question)
-      setSubmitting(false)
+      advanceQuestion()
     }
   }, [
-    submitting, selectedOption, currentQuestion, currentQIndex,
-    totalQuestions, attemptId, userId, quiz.time_per_question, supabase, router,
+    playbackState, currentQuestion, currentQIndex, totalQuestions,
+    attemptId, selectedOptionId, supabase, finalize, advanceQuestion, router,
   ])
 
+  // Countdown — auto-advances when it hits 0
   useEffect(() => {
     if (timeLeft <= 0) {
       handleNext()
       return
     }
-    const timer = setInterval(() => {
-      setTimeLeft((prev) => (prev > 0 ? prev - 1 : 0))
-    }, 1000)
-    return () => clearInterval(timer)
-  }, [timeLeft, currentQIndex, handleNext])
+    const id = setInterval(() => setTimeLeft((t) => (t > 0 ? t - 1 : 0)), 1000)
+    return () => clearInterval(id)
+  }, [timeLeft, handleNext])
 
   const progressPercent = ((currentQIndex + 1) / totalQuestions) * 100
   const timerPercent = (timeLeft / quiz.time_per_question) * 100
-
-  // Proportional warning thresholds: red at last 12.5%, orange at last 25%
   const redThreshold = Math.ceil(quiz.time_per_question * 0.125)
   const orangeThreshold = Math.ceil(quiz.time_per_question * 0.25)
   const timerColor =
@@ -118,6 +108,8 @@ export default function QuizClient({ quiz, questions, attemptId, userId }: Props
       : timeLeft <= orangeThreshold
       ? 'text-orange-400'
       : 'text-primary'
+
+  const isSubmitting = playbackState === 'SYNCING'
 
   return (
     <div className="min-h-full bg-white dark:bg-slate-900 flex flex-col relative">
@@ -208,27 +200,39 @@ export default function QuizClient({ quiz, questions, attemptId, userId }: Props
         </AnimatePresence>
 
         {/* Contributed by */}
-        {currentQuestion?.contributed_by && (
+        {currentQuestion?.contributed_by ? (
           <div className="flex items-center space-x-1.5 mb-5 px-1">
             <User className="w-3.5 h-3.5 text-slate-400" />
             <p className="text-xs text-slate-400 font-medium">
-              Contributed by <span className="font-semibold text-slate-500 dark:text-slate-400">{currentQuestion.contributed_by}</span>
+              Contributed by{' '}
+              <span className="font-semibold text-slate-500 dark:text-slate-400">
+                {currentQuestion.contributed_by}
+              </span>
             </p>
           </div>
+        ) : (
+          <div className="mb-4" />
         )}
 
-        {!currentQuestion?.contributed_by && <div className="mb-4" />}
+        {/* Evaluation error banner */}
+        {evalError && (
+          <div className="flex items-center gap-2 bg-red-50 border border-red-100 text-red-600 px-4 py-3 rounded-xl mb-4 text-sm">
+            <AlertCircle className="w-4 h-4 flex-shrink-0" />
+            <span>{evalError}</span>
+          </div>
+        )}
 
         {/* Options */}
         <div className="space-y-3 mb-8">
           {(currentQuestion?.options ?? [])
             .sort((a, b) => a.option_label.localeCompare(b.option_label))
             .map((opt) => {
-              const isSelected = selectedOption === opt.id
+              const isSelected = selectedOptionId === opt.id
               return (
                 <button
                   key={opt.id}
-                  onClick={() => setSelectedOption(opt.id)}
+                  onClick={() => selectAnswer(currentQuestion.id, opt.id)}
+                  disabled={isSubmitting}
                   className={`w-full flex items-center p-4 rounded-2xl border-2 transition-all duration-200 text-left ${
                     isSelected
                       ? 'border-primary bg-violet-50 dark:bg-violet-950/40 shadow-sm'
@@ -237,7 +241,9 @@ export default function QuizClient({ quiz, questions, attemptId, userId }: Props
                 >
                   <div
                     className={`w-8 h-8 rounded-full flex items-center justify-center text-sm font-bold mr-4 flex-shrink-0 transition-colors ${
-                      isSelected ? 'bg-primary text-white' : 'bg-white dark:bg-slate-700 text-slate-500 dark:text-slate-400 shadow-sm'
+                      isSelected
+                        ? 'bg-primary text-white'
+                        : 'bg-white dark:bg-slate-700 text-slate-500 dark:text-slate-400 shadow-sm'
                     }`}
                   >
                     {opt.option_label}
@@ -254,18 +260,18 @@ export default function QuizClient({ quiz, questions, attemptId, userId }: Props
             })}
         </div>
 
-        {/* Next Button */}
+        {/* Next / Finish Button */}
         <div className="mt-auto pb-8">
           <button
             onClick={handleNext}
-            disabled={!selectedOption || submitting}
+            disabled={!selectedOptionId || isSubmitting}
             className={`w-full py-4 rounded-2xl font-bold text-lg transition-all ${
-              selectedOption && !submitting
+              selectedOptionId && !isSubmitting
                 ? 'bg-primary text-white shadow-soft hover:bg-primaryHover active:scale-[0.98]'
                 : 'bg-gray-200 dark:bg-slate-700 text-gray-400 dark:text-slate-500 cursor-not-allowed'
             }`}
           >
-            {submitting
+            {isSubmitting
               ? 'Saving...'
               : currentQIndex === totalQuestions - 1
               ? 'Finish'
@@ -274,5 +280,13 @@ export default function QuizClient({ quiz, questions, attemptId, userId }: Props
         </div>
       </div>
     </div>
+  )
+}
+
+export default function QuizClient(props: Props) {
+  return (
+    <QuizPlaybackProvider attemptId={props.attemptId} totalQuestions={props.questions.length}>
+      <QuizInner {...props} />
+    </QuizPlaybackProvider>
   )
 }

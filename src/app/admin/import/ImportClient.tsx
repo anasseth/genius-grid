@@ -2,22 +2,25 @@
 
 import { useState, useRef } from 'react'
 import { useRouter } from 'next/navigation'
-import { Upload, FileJson, CheckCircle, AlertCircle, Loader2, ChevronRight } from 'lucide-react'
+import { Upload, FileJson, CheckCircle, AlertCircle, Loader2, ChevronRight, Eye } from 'lucide-react'
 import { createClient } from '@/lib/supabase/client'
+import {
+  ExamJsonSchema,
+  collectValidationErrors,
+  type QuestionValidationError,
+} from '@/lib/validations/quizImport'
 
-interface RawQuestion {
-  contributor?: string
-  question?: string
-  text?: string
-  options?: string[]
-  correct_answer?: string | null
-  explanation?: string
+interface ParsedOption {
+  text: string
+  label: string
+  isCorrect: boolean
 }
 
 interface ParsedQuestion {
   text: string
   contributor: string
-  options: { text: string; label: string; isCorrect: boolean }[]
+  options: ParsedOption[]
+  correctLetter: string | null
 }
 
 interface ParsedExam {
@@ -31,23 +34,25 @@ function stripOptionPrefix(opt: string): string {
 
 function parseExamJson(json: Record<string, unknown>, filename: string): ParsedExam {
   const rawTitle =
-    (json.exam as string) ||
+    (json.exam as string | undefined) ||
     filename.replace(/\.json$/i, '').replace(/^P\d+-/, '').trim()
 
-  const rawQuestions: RawQuestion[] = Array.isArray(json.questions)
-    ? (json.questions as RawQuestion[])
+  const rawQuestions = Array.isArray(json.questions)
+    ? (json.questions as Record<string, unknown>[])
     : []
 
   const questions: ParsedQuestion[] = rawQuestions
     .map((q) => {
-      const text = (q.question || q.text || '').trim()
+      const text = ((q.question as string | undefined) || (q.text as string | undefined) || '').trim()
       if (!text) return null
 
-      const rawOptions: string[] = Array.isArray(q.options) ? q.options : []
+      const rawOptions: string[] = Array.isArray(q.options)
+        ? (q.options as string[])
+        : []
       const labels = ['a', 'b', 'c', 'd']
-      const correctLetter = q.correct_answer?.toUpperCase()
+      const correctLetter = (q.correct_answer as string | undefined)?.toUpperCase() ?? null
 
-      const options = rawOptions.slice(0, 4).map((opt, idx) => ({
+      const options: ParsedOption[] = rawOptions.slice(0, 4).map((opt, idx) => ({
         text: stripOptionPrefix(opt),
         label: labels[idx] ?? String.fromCharCode(97 + idx),
         isCorrect: correctLetter ? 'ABCD'.indexOf(correctLetter) === idx : false,
@@ -55,11 +60,12 @@ function parseExamJson(json: Record<string, unknown>, filename: string): ParsedE
 
       return {
         text,
-        contributor: q.contributor?.trim() || '',
+        contributor: ((q.contributor as string | undefined) ?? '').trim(),
         options,
+        correctLetter,
       } satisfies ParsedQuestion
     })
-    .filter(Boolean) as ParsedQuestion[]
+    .filter((q): q is ParsedQuestion => q !== null)
 
   return { title: rawTitle, questions }
 }
@@ -72,6 +78,8 @@ export default function ImportClient() {
   const [parsed, setParsed] = useState<ParsedExam | null>(null)
   const [filename, setFilename] = useState('')
   const [parseError, setParseError] = useState<string | null>(null)
+  const [validationErrors, setValidationErrors] = useState<QuestionValidationError[]>([])
+  const [showPreview, setShowPreview] = useState(false)
 
   const [title, setTitle] = useState('')
   const [description, setDescription] = useState('')
@@ -88,29 +96,48 @@ export default function ImportClient() {
   const handleFile = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
     if (!file) return
+
     setParseError(null)
+    setValidationErrors([])
     setParsed(null)
     setImportResult(null)
     setImportError(null)
     setFilename(file.name)
+    setShowPreview(false)
 
     const reader = new FileReader()
     reader.onload = (ev) => {
       try {
-        const json = JSON.parse(ev.target?.result as string)
+        const json = JSON.parse(ev.target?.result as string) as Record<string, unknown>
+
+        // Zod schema validation
+        const zodResult = ExamJsonSchema.safeParse(json)
+        const errors = collectValidationErrors(zodResult)
+        if (errors.length > 0) {
+          setValidationErrors(errors)
+        }
+
+        // Still parse the file for preview, even if there are validation errors
         const result = parseExamJson(json, file.name)
         if (result.questions.length === 0) {
           setParseError('No valid questions found in this file.')
           return
         }
+
         setParsed(result)
         setTitle(result.title)
+        setShowPreview(true)
       } catch {
         setParseError('Invalid JSON file. Please check the file format.')
       }
     }
     reader.readAsText(file)
   }
+
+  const hasErrors = validationErrors.length > 0
+  const errorIndexSet = new Set(validationErrors.map((e) => e.index))
+  const errorCount = validationErrors.filter((e) => e.index >= 0).length
+  const readyCount = parsed ? parsed.questions.length - errorCount : 0
 
   const handleImport = async () => {
     if (!parsed) return
@@ -133,6 +160,7 @@ export default function ImportClient() {
         .insert({ name: categoryName.trim(), icon: '🤖', color: 'bg-blue-100' })
         .select()
         .single()
+
       if (catErr || !newCat) {
         setImportError(`Failed to create category: ${catErr?.message}`)
         setImporting(false)
@@ -141,57 +169,46 @@ export default function ImportClient() {
       categoryId = newCat.id
     }
 
-    // 2. Create quiz
-    const { data: quiz, error: quizErr } = await supabase
-      .from('quizzes')
-      .insert({
-        title: title.trim(),
-        description: description.trim() || null,
-        category_id: categoryId,
-        difficulty,
-        time_per_question: timePerQuestion,
-        questions_per_attempt: questionsPerAttempt,
-        max_retakes: maxRetakes,
-        is_published: true,
-      })
-      .select()
-      .single()
+    // 2. Only include questions that passed validation (skip errored indexes)
+    const validQuestions = parsed.questions
+      .map((q, i) => ({ q, i }))
+      .filter(({ i }) => !errorIndexSet.has(i))
+      .map(({ q, i }) => ({
+        text: q.text,
+        contributed_by: q.contributor || null,
+        options: q.options.map((o) => ({
+          text: o.text,
+          label: o.label,
+          is_correct: o.isCorrect,
+        })),
+      }))
 
-    if (quizErr || !quiz) {
-      setImportError(`Failed to create quiz: ${quizErr?.message}`)
+    // 3. Call the transactional import RPC — all-or-nothing via PLpgSQL BEGIN/COMMIT
+    const payload = {
+      title: title.trim(),
+      description: description.trim() || '',
+      category_id: categoryId,
+      difficulty,
+      time_per_question: timePerQuestion,
+      questions_per_attempt: questionsPerAttempt,
+      max_retakes: maxRetakes,
+      is_published: true,
+      questions: validQuestions,
+    }
+
+    const { data: quizId, error: rpcErr } = await supabase.rpc(
+      'import_quiz_transactional',
+      { p_data: payload }
+    )
+
+    if (rpcErr || !quizId) {
+      setImportError(`Import failed: ${rpcErr?.message ?? 'unknown error'}`)
       setImporting(false)
       return
     }
 
-    // 3. Insert questions + options in batches
-    let inserted = 0
-    for (let i = 0; i < parsed.questions.length; i++) {
-      const q = parsed.questions[i]
-      const { data: qRow, error: qErr } = await supabase
-        .from('questions')
-        .insert({
-          quiz_id: quiz.id,
-          text: q.text,
-          contributed_by: q.contributor || null,
-          order_index: i,
-        })
-        .select()
-        .single()
-
-      if (qErr || !qRow) continue
-
-      const opts = q.options.map((o) => ({
-        question_id: qRow.id,
-        text: o.text,
-        is_correct: o.isCorrect,
-        option_label: o.label,
-      }))
-      await supabase.from('options').insert(opts)
-      inserted++
-    }
-
     setImporting(false)
-    setImportResult({ quizId: quiz.id, count: inserted })
+    setImportResult({ quizId: quizId as string, count: validQuestions.length })
   }
 
   return (
@@ -261,6 +278,8 @@ export default function ImportClient() {
                 setImportResult(null)
                 setTitle('')
                 setDescription('')
+                setValidationErrors([])
+                setShowPreview(false)
               }}
               className="px-5 py-2.5 rounded-xl font-semibold text-sm border border-gray-200 text-slate-600 hover:bg-gray-50 transition-colors"
             >
@@ -270,13 +289,101 @@ export default function ImportClient() {
         </div>
       )}
 
+      {/* Validation summary + question preview */}
+      {parsed && !importResult && showPreview && (
+        <div className="bg-white rounded-2xl border border-gray-100 shadow-sm mb-6 overflow-hidden">
+          <div className="px-5 py-4 border-b border-gray-100 flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <Eye className="w-4 h-4 text-slate-500" />
+              <h2 className="font-bold text-slate-800 text-sm">Question Preview</h2>
+            </div>
+            <div className="flex items-center gap-2">
+              {errorCount > 0 ? (
+                <span className="text-xs font-bold bg-red-100 text-red-600 px-3 py-1 rounded-full">
+                  {errorCount} error{errorCount !== 1 ? 's' : ''}
+                </span>
+              ) : null}
+              <span className="text-xs font-bold bg-emerald-100 text-emerald-700 px-3 py-1 rounded-full">
+                {readyCount} ready
+              </span>
+            </div>
+          </div>
+
+          <div className="overflow-y-auto max-h-64">
+            <table className="w-full text-xs">
+              <thead className="bg-gray-50 sticky top-0">
+                <tr className="text-left">
+                  <th className="px-4 py-2 font-semibold text-slate-500 w-10">#</th>
+                  <th className="px-4 py-2 font-semibold text-slate-500">Question</th>
+                  <th className="px-4 py-2 font-semibold text-slate-500 w-16 text-center">Opts</th>
+                  <th className="px-4 py-2 font-semibold text-slate-500 w-16 text-center">Correct</th>
+                  <th className="px-4 py-2 font-semibold text-slate-500 w-24">Contributor</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-gray-50">
+                {parsed.questions.map((q, i) => {
+                  const rowErrors = validationErrors.filter((e) => e.index === i)
+                  const hasError = rowErrors.length > 0
+                  return (
+                    <>
+                      <tr
+                        key={`q-${i}`}
+                        className={hasError ? 'bg-red-50' : 'hover:bg-gray-50/50'}
+                      >
+                        <td className="px-4 py-2.5 text-slate-400 font-mono">{i + 1}</td>
+                        <td className="px-4 py-2.5 text-slate-700 font-medium">
+                          <div className="flex items-center gap-2">
+                            {hasError && <AlertCircle className="w-3.5 h-3.5 text-red-500 flex-shrink-0" />}
+                            <span className="line-clamp-2">
+                              {q.text.length > 80 ? q.text.slice(0, 80) + '…' : q.text}
+                            </span>
+                          </div>
+                        </td>
+                        <td className="px-4 py-2.5 text-slate-500 text-center">{q.options.length}</td>
+                        <td className="px-4 py-2.5 text-center">
+                          {q.correctLetter ? (
+                            <span className="font-bold text-emerald-600 uppercase">{q.correctLetter}</span>
+                          ) : (
+                            <span className="text-slate-300">—</span>
+                          )}
+                        </td>
+                        <td className="px-4 py-2.5 text-slate-400 truncate max-w-0">
+                          {q.contributor || '—'}
+                        </td>
+                      </tr>
+                      {hasError && rowErrors.map((err) =>
+                        err.messages.map((msg, mi) => (
+                          <tr key={`err-${i}-${mi}`} className="bg-red-50">
+                            <td />
+                            <td colSpan={4} className="px-4 pb-2 text-red-500">
+                              {msg}
+                            </td>
+                          </tr>
+                        ))
+                      )}
+                    </>
+                  )
+                })}
+              </tbody>
+            </table>
+          </div>
+
+          {hasErrors && (
+            <div className="px-5 py-3 bg-amber-50 border-t border-amber-100 text-xs text-amber-700 font-medium">
+              {errorCount} question{errorCount !== 1 ? 's' : ''} will be skipped during import.
+              Only {readyCount} valid question{readyCount !== 1 ? 's' : ''} will be saved.
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Quiz settings form */}
       {parsed && !importResult && (
         <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-6 space-y-5">
           <div className="flex items-center justify-between">
             <h2 className="text-lg font-bold text-slate-800">Quiz Settings</h2>
             <span className="text-xs font-bold text-primary bg-violet-50 px-3 py-1 rounded-full">
-              {parsed.questions.length} questions
+              {readyCount} question{readyCount !== 1 ? 's' : ''} to import
             </span>
           </div>
 
@@ -317,7 +424,7 @@ export default function ImportClient() {
               <label className="block text-sm font-semibold text-slate-700 mb-2">Difficulty</label>
               <select
                 value={difficulty}
-                onChange={(e) => setDifficulty(e.target.value as any)}
+                onChange={(e) => setDifficulty(e.target.value as 'Easy' | 'Medium' | 'Hard')}
                 className="w-full px-4 py-3 border border-gray-200 rounded-xl text-slate-800 focus:ring-2 focus:ring-primary focus:outline-none bg-white text-sm"
               >
                 <option value="Easy">Easy</option>
@@ -373,18 +480,18 @@ export default function ImportClient() {
 
           <button
             onClick={handleImport}
-            disabled={importing || !title.trim()}
+            disabled={importing || !title.trim() || readyCount === 0}
             className="w-full bg-primary text-white py-3.5 rounded-xl font-bold text-sm flex items-center justify-center gap-2 hover:bg-primaryHover transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
           >
             {importing ? (
               <>
                 <Loader2 className="w-4 h-4 animate-spin" />
-                Importing {parsed.questions.length} questions...
+                Importing {readyCount} questions…
               </>
             ) : (
               <>
                 <Upload className="w-4 h-4" />
-                Import Quiz
+                Import {readyCount} Question{readyCount !== 1 ? 's' : ''}
               </>
             )}
           </button>
